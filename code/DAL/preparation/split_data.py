@@ -9,6 +9,7 @@ from DAL.preparation.config import (
     TEST_RATIO,
     VAL_RATIO,
     INITIAL_LABEL_RATIO,
+    ALL_LABELS,
 )
 
 
@@ -21,7 +22,9 @@ def prepare_train_dataframe(train_df_raw: pd.DataFrame) -> pd.DataFrame:
     df["label_list"] = df["labels"].apply(lambda x: str(x).split())
     df["num_labels"] = df["label_list"].apply(len)
     df["label_combo"] = df["label_list"].apply(lambda x: " | ".join(sorted(x)))
-    df["primary_label"] = df["label_list"].apply(lambda x: x[0] if len(x) > 0 else "unknown")
+    df["primary_label"] = df["label_list"].apply(
+        lambda x: x[0] if len(x) > 0 else "unknown"
+    )
     df["is_multilabel"] = df["num_labels"] > 1
 
     return df
@@ -40,22 +43,19 @@ def _safe_stratify_series(series: pd.Series):
     return None
 
 
-def _attach_encoded_columns(df: pd.DataFrame, y: np.ndarray, class_names: list[str]) -> pd.DataFrame:
+def _attach_encoded_columns(
+    df: pd.DataFrame,
+    y: np.ndarray,
+    class_names: list[str],
+) -> pd.DataFrame:
     out = df.copy()
     for i, cls in enumerate(class_names):
-        out[f"y_{cls}"] = y[:, i]
+        out[f"y_{cls}"] = y[:, i] if len(y) > 0 else np.array([], dtype=np.float32)
     return out
 
 
 def create_data_splits(train_df: pd.DataFrame, y_all: np.ndarray, seed: int = 42):
-    class_names = [col for col in [
-        "complex",
-        "frog_eye_leaf_spot",
-        "healthy",
-        "powdery_mildew",
-        "rust",
-        "scab"
-    ]]
+    class_names = list(ALL_LABELS)
 
     stratify_full = _safe_stratify_series(train_df["label_combo"])
 
@@ -119,12 +119,12 @@ def create_data_splits(train_df: pd.DataFrame, y_all: np.ndarray, seed: int = 42
     train_pool_df_encoded = _attach_encoded_columns(train_pool_df, y_train_pool, class_names)
     val_df_encoded = _attach_encoded_columns(val_df, y_val, class_names)
     test_df_encoded = _attach_encoded_columns(test_df, y_test, class_names)
-    initial_labeled_df_encoded = _attach_encoded_columns(initial_labeled_df, y_initial_labeled, class_names)
-
-    if len(unlabeled_pool_df) > 0:
-        unlabeled_pool_df_encoded = _attach_encoded_columns(unlabeled_pool_df, y_unlabeled_pool, class_names)
-    else:
-        unlabeled_pool_df_encoded = unlabeled_pool_df.copy()
+    initial_labeled_df_encoded = _attach_encoded_columns(
+        initial_labeled_df, y_initial_labeled, class_names
+    )
+    unlabeled_pool_df_encoded = _attach_encoded_columns(
+        unlabeled_pool_df, y_unlabeled_pool, class_names
+    )
 
     return {
         "train_df": train_df_encoded,

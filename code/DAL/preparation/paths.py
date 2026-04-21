@@ -3,6 +3,7 @@ import os
 from DAL.preparation.config import (
     EXTRACTED_DATASET_DIR,
     REPORTS_DIR,
+    ANNOTATIONS_DIR,
 )
 
 
@@ -11,20 +12,23 @@ def ensure_report_directories():
     os.makedirs(os.path.join(REPORTS_DIR, "splits"), exist_ok=True)
     os.makedirs(os.path.join(REPORTS_DIR, "eda"), exist_ok=True)
     os.makedirs(os.path.join(REPORTS_DIR, "metadata"), exist_ok=True)
+    os.makedirs(ANNOTATIONS_DIR, exist_ok=True)
 
 
 def _resolve_dataset_root(extracted_root: str) -> str:
     if not extracted_root:
         raise ValueError("EXTRACTED_DATASET_DIR is empty.")
 
+    if not os.path.exists(extracted_root):
+        raise FileNotFoundError(
+            f"Extracted dataset root does not exist: {extracted_root}"
+        )
+
     train_csv_direct = os.path.join(extracted_root, "train.csv")
     sample_csv_direct = os.path.join(extracted_root, "sample_submission.csv")
 
     if os.path.exists(train_csv_direct) and os.path.exists(sample_csv_direct):
         return extracted_root
-
-    if not os.path.exists(extracted_root):
-        raise FileNotFoundError(f"Extracted dataset root does not exist: {extracted_root}")
 
     for item in os.listdir(extracted_root):
         candidate = os.path.join(extracted_root, item)
@@ -33,6 +37,7 @@ def _resolve_dataset_root(extracted_root: str) -> str:
 
         train_csv = os.path.join(candidate, "train.csv")
         sample_csv = os.path.join(candidate, "sample_submission.csv")
+
         if os.path.exists(train_csv) and os.path.exists(sample_csv):
             return candidate
 
@@ -52,7 +57,9 @@ def get_dataset_paths():
     if not os.path.exists(train_csv):
         raise FileNotFoundError(f"Missing train.csv: {train_csv}")
     if not os.path.exists(sample_submission_csv):
-        raise FileNotFoundError(f"Missing sample_submission.csv: {sample_submission_csv}")
+        raise FileNotFoundError(
+            f"Missing sample_submission.csv: {sample_submission_csv}"
+        )
     if not os.path.exists(train_dir):
         raise FileNotFoundError(f"Missing train_images: {train_dir}")
     if not os.path.exists(test_dir):
@@ -64,4 +71,6 @@ def get_dataset_paths():
         "sample_submission_csv": sample_submission_csv,
         "train_dir": train_dir,
         "test_dir": test_dir,
+        "reports_dir": REPORTS_DIR,
+        "annotations_dir": ANNOTATIONS_DIR,
     }

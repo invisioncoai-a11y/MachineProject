@@ -24,6 +24,9 @@ def _plot_class_distribution(train_df, all_labels, save_path):
 
 
 def _plot_label_combo_distribution(train_df, save_path, top_k=12):
+    if "label_combo" not in train_df.columns:
+        return
+
     combo_counts = train_df["label_combo"].value_counts().head(top_k)
 
     plt.figure(figsize=(12, 5))
@@ -64,9 +67,9 @@ def _save_summary_json(data_bundle, save_path):
         "num_images": int(len(train_df)),
         "num_classes": int(len(data_bundle["all_labels"])),
         "all_labels": list(data_bundle["all_labels"]),
-        "num_multilabel_images": int(train_df["is_multilabel"].sum()),
-        "num_singlelabel_images": int((~train_df["is_multilabel"]).sum()),
-        "num_unique_label_combinations": int(train_df["label_combo"].nunique()),
+        "num_multilabel_images": int(train_df["is_multilabel"].sum()) if "is_multilabel" in train_df.columns else 0,
+        "num_singlelabel_images": int((~train_df["is_multilabel"]).sum()) if "is_multilabel" in train_df.columns else 0,
+        "num_unique_label_combinations": int(train_df["label_combo"].nunique()) if "label_combo" in train_df.columns else 0,
         "split_sizes": {
             "train_pool": int(len(data_bundle["train_pool_df"])),
             "validation": int(len(data_bundle["val_df"])),
