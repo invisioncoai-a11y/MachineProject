@@ -1,5 +1,5 @@
 import os
-from typing import Dict
+from typing import Dict, List
 
 import cv2
 import numpy as np
@@ -97,13 +97,53 @@ def _patch_rgb_to_pil(patch_rgb: np.ndarray) -> Image.Image:
     return Image.fromarray(patch_uint8)
 
 
+def _resize_binary_mask(mask: np.ndarray, out_size: int = IMG_SIZE) -> torch.Tensor:
+    """
+    Convert variable-size lesion mask to fixed [1, out_size, out_size]
+    باستخدام nearest-neighbor حتى نحافظ على binary structure.
+    """
+    mask_uint8 = (mask > 0).astype(np.uint8) * 255
+    resized = cv2.resize(
+        mask_uint8,
+        (out_size, out_size),
+        interpolation=cv2.INTER_NEAREST,
+    )
+    resized = (resized > 0).astype(np.float32)
+    return torch.from_numpy(resized).unsqueeze(0)  # [1, H, W]
+
+
+def _compute_patch_lesion_ratio(mask: np.ndarray, box) -> float:
+    """
+    نسبة تغطية الـ lesion داخل patch box.
+    هذا مفيد جدًا لاحقًا لو بدك lesion sparsity / patch attention guidance.
+    """
+    x1, y1, x2, y2 = box
+
+    h, w = mask.shape[:2]
+    x1 = max(0, min(int(x1), w))
+    x2 = max(0, min(int(x2), w))
+    y1 = max(0, min(int(y1), h))
+    y2 = max(0, min(int(y2), h))
+
+    if x2 <= x1 or y2 <= y1:
+        return 0.0
+
+    crop = mask[y1:y2, x1:x2]
+    area = float((y2 - y1) * (x2 - x1))
+    if area <= 0:
+        return 0.0
+
+    lesion_pixels = float((crop > 0).sum())
+    return lesion_pixels / area
+
+
 class ImagePatchDataset(Dataset):
     """
-    Image-level dataset:
-    - reads one full image
-    - extracts 1..K lesion patches on-the-fly
-    - returns fixed-size patch tensor stack [K, 3, H, W]
-    - returns image-level multi-label target
+    Image-level dataset
+    - reads full image normally
+    - extracts lesion candidate patches
+    - returns fixed patch tensors
+    - keeps lesion information in a training-compatible form
     """
 
     def __init__(
@@ -143,7 +183,8 @@ class ImagePatchDataset(Dataset):
 
         patch_tensors = []
         patch_boxes = []
-        patch_mask = []
+        patch_valid_mask = []
+        patch_lesion_ratio = []
 
         for patch_rgb, box in zip(patches_rgb, boxes):
             patch_pil = _patch_rgb_to_pil(patch_rgb)
@@ -151,42 +192,99 @@ class ImagePatchDataset(Dataset):
 
             patch_tensors.append(patch_tensor)
             patch_boxes.append(torch.tensor(box, dtype=torch.int64))
-            patch_mask.append(1)
+            patch_valid_mask.append(1.0)
+            patch_lesion_ratio.append(float(_compute_patch_lesion_ratio(lesion_mask, box)))
 
         while len(patch_tensors) < self.max_patches:
             patch_tensors.append(torch.zeros((3, IMG_SIZE, IMG_SIZE), dtype=torch.float32))
             patch_boxes.append(torch.tensor([-1, -1, -1, -1], dtype=torch.int64))
-            patch_mask.append(0)
+            patch_valid_mask.append(0.0)
+            patch_lesion_ratio.append(0.0)
 
-        patch_stack = torch.stack(patch_tensors, dim=0)            # [K, 3, H, W]
-        patch_boxes = torch.stack(patch_boxes, dim=0)              # [K, 4]
-        patch_mask = torch.tensor(patch_mask, dtype=torch.float32) # [K]
+        patch_stack = torch.stack(patch_tensors, dim=0)               # [K,3,H,W]
+        patch_boxes = torch.stack(patch_boxes, dim=0)                 # [K,4]
+        patch_valid_mask = torch.tensor(patch_valid_mask, dtype=torch.float32)     # [K]
+        patch_lesion_ratio = torch.tensor(patch_lesion_ratio, dtype=torch.float32) # [K]
 
-        lesion_mask_tensor = torch.from_numpy(lesion_mask.astype(np.uint8))
+        lesion_mask_resized = _resize_binary_mask(lesion_mask, IMG_SIZE)  # [1,H,W]
 
-        return patch_stack, patch_boxes, patch_mask, lesion_mask_tensor, len(patches_rgb)
+        return {
+            "patches": patch_stack,
+            "patch_boxes": patch_boxes,
+            "patch_mask": patch_valid_mask,
+            "patch_lesion_ratio": patch_lesion_ratio,
+            "lesion_mask_resized": lesion_mask_resized,
+            "lesion_mask_raw": lesion_mask.astype(np.uint8),  # metadata only
+            "num_valid_patches": int(len(patches_rgb)),
+        }
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
         image_name = row["image"]
 
         image_bgr, image_path = self._read_image(image_name)
-        patch_stack, patch_boxes, patch_mask, lesion_mask_tensor, num_valid_patches = self._build_patch_stack(image_bgr)
+        h0, w0 = image_bgr.shape[:2]
+
+        patch_bundle = self._build_patch_stack(image_bgr)
 
         item = {
-            "patches": patch_stack,
-            "patch_boxes": patch_boxes,
-            "patch_mask": patch_mask,
-            "lesion_mask": lesion_mask_tensor,
-            "num_valid_patches": int(num_valid_patches),
-            "image_name": image_name,
-            "source_path": image_path,
+            "patches": patch_bundle["patches"],
+            "patch_boxes": patch_bundle["patch_boxes"],
+            "patch_mask": patch_bundle["patch_mask"],
+            "patch_lesion_ratio": patch_bundle["patch_lesion_ratio"],
+            "lesion_mask_resized": patch_bundle["lesion_mask_resized"],
+
+            # metadata
+            "lesion_mask_raw": patch_bundle["lesion_mask_raw"],
+            "num_valid_patches": patch_bundle["num_valid_patches"],
+            "image_name": str(image_name),
+            "source_path": str(image_path),
+            "original_hw": (int(h0), int(w0)),
         }
 
         if self.return_targets:
             item["target"] = _target_from_row(row, self.all_labels)
 
         return item
+
+
+def image_patch_collate_fn(batch: List[dict]):
+    """
+    stack only fixed-size tensors
+    keep variable-size metadata as lists
+    """
+    out = {}
+
+    tensor_keys = [
+        "patches",
+        "patch_boxes",
+        "patch_mask",
+        "patch_lesion_ratio",
+        "lesion_mask_resized",
+    ]
+
+    optional_tensor_keys = ["target"]
+
+    list_keys = [
+        "lesion_mask_raw",
+        "num_valid_patches",
+        "image_name",
+        "source_path",
+        "original_hw",
+    ]
+
+    for key in tensor_keys:
+        out[key] = torch.stack([sample[key] for sample in batch], dim=0)
+
+    for key in optional_tensor_keys:
+        if key in batch[0]:
+            out[key] = torch.stack([sample[key] for sample in batch], dim=0)
+
+    for key in list_keys:
+        if key in batch[0]:
+            out[key] = [sample[key] for sample in batch]
+
+    return out
 
 
 def make_loader(
@@ -213,6 +311,7 @@ def make_loader(
         shuffle=shuffle,
         num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
+        collate_fn=image_patch_collate_fn,
     )
     return loader
 
