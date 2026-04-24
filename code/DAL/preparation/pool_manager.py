@@ -1,217 +1,326 @@
 import os
 import json
+from typing import Dict, Optional
+
 import pandas as pd
 
 from DAL.preparation.config import (
-    ALL_LABELS,
-    REPORTS_DIR,
-    SEED,
+    ANNOTATIONS_DIR,
+    QUERY_BATCH_SIZE,
 )
 
-from DAL.preparation.paths import (
-    ensure_report_directories,
-    get_dataset_paths,
-)
 
-from DAL.preparation.split_data import (
-    prepare_train_dataframe,
-    fit_label_binarizer,
-    create_data_splits,
-    save_split_csvs,
-)
+def ensure_pool_manager_directories(annotations_dir: str = ANNOTATIONS_DIR):
+    rounds_dir = os.path.join(annotations_dir, "rounds")
+    management_dir = os.path.join(annotations_dir, "management")
 
-from DAL.preparation.pool_manager import (
-    initialize_image_pool_state_from_split_bundle,
-)
+    os.makedirs(annotations_dir, exist_ok=True)
+    os.makedirs(rounds_dir, exist_ok=True)
+    os.makedirs(management_dir, exist_ok=True)
 
-from DAL.eda.explore_dataset import run_eda_pipeline
+    return {
+        "annotations_dir": annotations_dir,
+        "rounds_dir": rounds_dir,
+        "management_dir": management_dir,
+    }
 
 
-def _shape_or_empty(df):
-    if df is None:
-        return [0, 0]
-    return list(df.shape)
+def _align_columns(df: pd.DataFrame, columns):
+    out = df.copy()
+    for col in columns:
+        if col not in out.columns:
+            out[col] = None
+    return out[list(columns)]
 
 
-def _save_metadata(
-    data_bundle: dict,
-    pool_state: dict,
-    reports_dir: str,
+def _save_csv(df: pd.DataFrame, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    df.to_csv(path, index=False)
+
+
+def _save_json(obj: dict, path: str):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, ensure_ascii=False)
+
+
+def _require_columns(df: pd.DataFrame, required_cols, df_name: str):
+    missing = [c for c in required_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"{df_name} is missing required columns: {missing}")
+
+
+def initialize_image_pool_state_from_split_bundle(
+    split_bundle: Dict[str, pd.DataFrame],
+    annotations_dir: str = ANNOTATIONS_DIR,
+    save_round0_snapshot: bool = True,
 ):
-    meta_dir = os.path.join(reports_dir, "metadata")
-    os.makedirs(meta_dir, exist_ok=True)
+    """
+    Initialize image-level active learning pools from split bundle.
+    Required keys:
+    - initial_labeled_df
+    - unlabeled_pool_df
+    - val_df
+    - test_df
+    """
+    dirs = ensure_pool_manager_directories(annotations_dir)
+    rounds_dir = dirs["rounds_dir"]
+    management_dir = dirs["management_dir"]
 
-    meta_path = os.path.join(meta_dir, "pipeline_metadata.json")
+    labeled_df = split_bundle.get("initial_labeled_df", pd.DataFrame()).copy()
+    unlabeled_df = split_bundle.get("unlabeled_pool_df", pd.DataFrame()).copy()
+    val_df = split_bundle.get("val_df", pd.DataFrame()).copy()
+    test_df = split_bundle.get("test_df", pd.DataFrame()).copy()
 
-    serializable = {
-        "project_root": data_bundle["project_root"],
-        "dataset_root": data_bundle["dataset_root"],
-        "train_csv": data_bundle["train_csv"],
-        "sample_submission_csv": data_bundle["sample_submission_csv"],
-        "train_dir": data_bundle["train_dir"],
-        "test_dir": data_bundle["test_dir"],
-        "reports_dir": data_bundle["reports_dir"],
-        "all_labels": data_bundle["all_labels"],
+    if len(labeled_df) > 0:
+        _require_columns(labeled_df, ["image"], "initial_labeled_df")
+    if len(unlabeled_df) > 0:
+        _require_columns(unlabeled_df, ["image"], "unlabeled_pool_df")
 
-        "image_level_shapes": {
-            "train_df": _shape_or_empty(data_bundle.get("train_df")),
-            "train_pool_df": _shape_or_empty(data_bundle.get("train_pool_df")),
-            "val_df": _shape_or_empty(data_bundle.get("val_df")),
-            "test_df": _shape_or_empty(data_bundle.get("test_df")),
-            "initial_labeled_df": _shape_or_empty(data_bundle.get("initial_labeled_df")),
-            "unlabeled_pool_df": _shape_or_empty(data_bundle.get("unlabeled_pool_df")),
-            "sample_df": _shape_or_empty(data_bundle.get("sample_df")),
+    base_paths = {
+        "labeled": os.path.join(annotations_dir, "labeled_images.csv"),
+        "unlabeled": os.path.join(annotations_dir, "unlabeled_images.csv"),
+        "val": os.path.join(annotations_dir, "val_images.csv"),
+        "test": os.path.join(annotations_dir, "test_images.csv"),
+    }
+
+    _save_csv(labeled_df, base_paths["labeled"])
+    _save_csv(unlabeled_df, base_paths["unlabeled"])
+    _save_csv(val_df, base_paths["val"])
+    _save_csv(test_df, base_paths["test"])
+
+    summary = {
+        "num_labeled_images": int(len(labeled_df)),
+        "num_unlabeled_images": int(len(unlabeled_df)),
+        "num_val_images": int(len(val_df)),
+        "num_test_images": int(len(test_df)),
+    }
+
+    _save_json(summary, os.path.join(management_dir, "pool_state_summary.json"))
+
+    if save_round0_snapshot:
+        round0_dir = os.path.join(rounds_dir, "round_00")
+        os.makedirs(round0_dir, exist_ok=True)
+
+        _save_csv(labeled_df, os.path.join(round0_dir, "labeled_before_training.csv"))
+        _save_csv(unlabeled_df, os.path.join(round0_dir, "unlabeled_before_query.csv"))
+        _save_json(summary, os.path.join(round0_dir, "round_00_summary.json"))
+
+    print("\n===== IMAGE POOL MANAGER: INITIALIZED =====")
+    print("Annotations dir:", annotations_dir)
+    print("Labeled images:", len(labeled_df))
+    print("Unlabeled images:", len(unlabeled_df))
+    print("Val images:", len(val_df))
+    print("Test images:", len(test_df))
+
+    return {
+        "labeled_df": labeled_df,
+        "unlabeled_df": unlabeled_df,
+        "val_df": val_df,
+        "test_df": test_df,
+        "paths": base_paths,
+        "summary": summary,
+    }
+
+
+def load_pool_state(annotations_dir: str = ANNOTATIONS_DIR):
+    labeled_path = os.path.join(annotations_dir, "labeled_images.csv")
+    unlabeled_path = os.path.join(annotations_dir, "unlabeled_images.csv")
+    val_path = os.path.join(annotations_dir, "val_images.csv")
+    test_path = os.path.join(annotations_dir, "test_images.csv")
+
+    if not os.path.exists(labeled_path):
+        raise FileNotFoundError(f"Missing labeled pool file: {labeled_path}")
+    if not os.path.exists(unlabeled_path):
+        raise FileNotFoundError(f"Missing unlabeled pool file: {unlabeled_path}")
+
+    labeled_df = pd.read_csv(labeled_path)
+    unlabeled_df = pd.read_csv(unlabeled_path)
+    val_df = pd.read_csv(val_path) if os.path.exists(val_path) else pd.DataFrame()
+    test_df = pd.read_csv(test_path) if os.path.exists(test_path) else pd.DataFrame()
+
+    return {
+        "labeled_df": labeled_df,
+        "unlabeled_df": unlabeled_df,
+        "val_df": val_df,
+        "test_df": test_df,
+        "paths": {
+            "labeled": labeled_path,
+            "unlabeled": unlabeled_path,
+            "val": val_path,
+            "test": test_path,
         },
-
-        "pool_state_summary": pool_state.get("summary", {}),
-        "pool_paths": pool_state.get("paths", {}),
     }
 
-    with open(meta_path, "w", encoding="utf-8") as f:
-        json.dump(serializable, f, indent=2, ensure_ascii=False)
 
-    return meta_path
+def save_pool_state(
+    labeled_df: pd.DataFrame,
+    unlabeled_df: pd.DataFrame,
+    val_df: Optional[pd.DataFrame] = None,
+    test_df: Optional[pd.DataFrame] = None,
+    annotations_dir: str = ANNOTATIONS_DIR,
+):
+    _save_csv(labeled_df, os.path.join(annotations_dir, "labeled_images.csv"))
+    _save_csv(unlabeled_df, os.path.join(annotations_dir, "unlabeled_images.csv"))
+
+    if val_df is not None:
+        _save_csv(val_df, os.path.join(annotations_dir, "val_images.csv"))
+    if test_df is not None:
+        _save_csv(test_df, os.path.join(annotations_dir, "test_images.csv"))
 
 
-def run_data_pipeline():
+def select_query_batch(
+    unlabeled_df: pd.DataFrame,
+    scored_df: pd.DataFrame,
+    round_id: int,
+    k: int = QUERY_BATCH_SIZE,
+    score_col: str = "query_score",
+    annotations_dir: str = ANNOTATIONS_DIR,
+):
     """
-    Image-level data pipeline only.
-
-    1) Ensure report directories
-    2) Resolve dataset paths
-    3) Read train/sample CSVs
-    4) Build image-level dataframe
-    5) Fit label binarizer
-    6) Create image-level splits
-    7) Save image-level split CSVs
-    8) Run image-level EDA
-    9) Initialize image-level active learning pool state
-    10) Save combined metadata
-
-    Returns a single pipeline bundle for RUN.py / model pipeline.
+    Select top-k images from unlabeled pool using image-level scores.
+    scored_df must contain:
+    - image
+    - query_score (or provided score_col)
     """
-    ensure_report_directories()
+    if len(unlabeled_df) == 0:
+        raise ValueError("unlabeled_df is empty.")
 
-    # -------------------------
-    # Resolve dataset paths
-    # -------------------------
-    dataset_paths = get_dataset_paths()
-    dataset_root = dataset_paths["dataset_root"]
-    train_csv = dataset_paths["train_csv"]
-    sample_submission_csv = dataset_paths["sample_submission_csv"]
-    train_dir = dataset_paths["train_dir"]
-    test_dir = dataset_paths["test_dir"]
+    _require_columns(unlabeled_df, ["image"], "unlabeled_df")
+    _require_columns(scored_df, ["image", score_col], "scored_df")
 
-    # -------------------------
-    # Read CSVs
-    # -------------------------
-    train_df_raw = pd.read_csv(train_csv)
-    sample_df = pd.read_csv(sample_submission_csv)
+    dirs = ensure_pool_manager_directories(annotations_dir)
+    round_dir = os.path.join(dirs["rounds_dir"], f"round_{round_id:02d}")
+    os.makedirs(round_dir, exist_ok=True)
 
-    # -------------------------
-    # Image-level preparation
-    # -------------------------
-    train_df = prepare_train_dataframe(train_df_raw)
-    mlb, y_all = fit_label_binarizer(train_df, ALL_LABELS)
+    base_cols = list(unlabeled_df.columns)
 
-    split_bundle = create_data_splits(
-        train_df=train_df,
-        y_all=y_all,
-        seed=SEED,
+    score_cols = [c for c in scored_df.columns if c != "image"]
+    merged = unlabeled_df.merge(
+        scored_df[["image"] + score_cols],
+        on="image",
+        how="left",
     )
 
-    save_split_csvs(split_bundle, REPORTS_DIR)
+    if merged[score_col].isna().all():
+        raise ValueError(f"All values in '{score_col}' are NaN after merge.")
 
-    data_bundle = {
-        "project_root": os.environ.get("PROJECT_ROOT", os.getcwd()),
-        "dataset_root": dataset_root,
-        "train_csv": train_csv,
-        "sample_submission_csv": sample_submission_csv,
-        "train_dir": train_dir,
-        "test_dir": test_dir,
-        "reports_dir": REPORTS_DIR,
-        "all_labels": list(mlb.classes_),
-        "mlb": mlb,
-        "sample_df": sample_df,
-        **split_bundle,
+    merged = merged.sort_values(score_col, ascending=False).reset_index(drop=True)
+
+    k = min(int(k), len(merged))
+    selected_df = merged.head(k).copy()
+    selected_df["selected_for_query"] = 1
+    selected_df["query_round"] = int(round_id)
+    selected_df["pool"] = "queried"
+
+    remaining_unlabeled_df = merged.iloc[k:].copy()
+    remaining_unlabeled_df = remaining_unlabeled_df[base_cols].copy()
+
+    _save_csv(merged, os.path.join(round_dir, "scored_unlabeled.csv"))
+    _save_csv(selected_df, os.path.join(round_dir, "selected_for_query.csv"))
+    _save_csv(remaining_unlabeled_df, os.path.join(round_dir, "unlabeled_after_selection.csv"))
+
+    summary = {
+        "round_id": int(round_id),
+        "selection_size": int(len(selected_df)),
+        "remaining_unlabeled": int(len(remaining_unlabeled_df)),
+        "score_col": score_col,
+    }
+    _save_json(summary, os.path.join(round_dir, "selection_summary.json"))
+
+    print(f"\n===== IMAGE POOL MANAGER: ROUND {round_id} SELECTION =====")
+    print("Selected images:", len(selected_df))
+    print("Remaining unlabeled:", len(remaining_unlabeled_df))
+
+    return {
+        "selected_df": selected_df,
+        "remaining_unlabeled_df": remaining_unlabeled_df,
+        "round_dir": round_dir,
+        "summary": summary,
     }
 
-    # -------------------------
-    # Image-level EDA
-    # -------------------------
-    run_eda_pipeline(data_bundle)
 
-    # -------------------------
-    # Initialize image-level pool state
-    # -------------------------
-    pool_state = initialize_image_pool_state_from_split_bundle(
-        split_bundle=split_bundle,
+def commit_selected_batch(
+    labeled_df: pd.DataFrame,
+    unlabeled_df: pd.DataFrame,
+    selected_df: pd.DataFrame,
+    round_id: int,
+    annotations_dir: str = ANNOTATIONS_DIR,
+):
+    """
+    Move selected images from unlabeled -> labeled.
+    """
+    if len(selected_df) == 0:
+        raise ValueError("selected_df is empty.")
+
+    _require_columns(labeled_df, ["image"], "labeled_df")
+    _require_columns(unlabeled_df, ["image"], "unlabeled_df")
+    _require_columns(selected_df, ["image"], "selected_df")
+
+    dirs = ensure_pool_manager_directories(annotations_dir)
+    round_dir = os.path.join(dirs["rounds_dir"], f"round_{round_id:02d}")
+    os.makedirs(round_dir, exist_ok=True)
+
+    selected = selected_df.copy()
+    selected["query_round"] = int(round_id)
+    selected["selected_for_query"] = 1
+    selected["pool"] = "labeled"
+
+    remaining_unlabeled_df = unlabeled_df[
+        ~unlabeled_df["image"].isin(selected["image"])
+    ].copy()
+
+    union_cols = list(dict.fromkeys(list(labeled_df.columns) + list(selected.columns)))
+    labeled_aligned = _align_columns(labeled_df, union_cols)
+    selected_aligned = _align_columns(selected, union_cols)
+
+    updated_labeled_df = pd.concat(
+        [labeled_aligned, selected_aligned],
+        ignore_index=True,
+    ).drop_duplicates(subset=["image"], keep="last")
+
+    save_pool_state(
+        labeled_df=updated_labeled_df,
+        unlabeled_df=remaining_unlabeled_df,
+        annotations_dir=annotations_dir,
     )
 
-    # -------------------------
-    # Save combined metadata
-    # -------------------------
-    metadata_path = _save_metadata(
-        data_bundle=data_bundle,
-        pool_state=pool_state,
-        reports_dir=REPORTS_DIR,
-    )
+    _save_csv(selected, os.path.join(round_dir, "selected_committed.csv"))
+    _save_csv(updated_labeled_df, os.path.join(round_dir, "labeled_after_update.csv"))
+    _save_csv(remaining_unlabeled_df, os.path.join(round_dir, "unlabeled_after_update.csv"))
 
-    # -------------------------
-    # Final combined output
-    # -------------------------
-    pipeline_bundle = {
-        "project_root": data_bundle["project_root"],
-        "dataset_root": data_bundle["dataset_root"],
-        "train_csv": data_bundle["train_csv"],
-        "sample_submission_csv": data_bundle["sample_submission_csv"],
-        "train_dir": data_bundle["train_dir"],
-        "test_dir": data_bundle["test_dir"],
-        "reports_dir": data_bundle["reports_dir"],
-        "all_labels": data_bundle["all_labels"],
-        "mlb": data_bundle["mlb"],
-        "sample_df": data_bundle["sample_df"],
+    summary = {
+        "round_id": int(round_id),
+        "newly_added": int(len(selected)),
+        "total_labeled_after_update": int(len(updated_labeled_df)),
+        "total_unlabeled_after_update": int(len(remaining_unlabeled_df)),
+    }
+    _save_json(summary, os.path.join(round_dir, "update_summary.json"))
 
-        # image-level
-        "train_df": data_bundle["train_df"],
-        "train_pool_df": data_bundle["train_pool_df"],
-        "val_df": data_bundle["val_df"],
-        "test_df": data_bundle["test_df"],
-        "initial_labeled_df": data_bundle["initial_labeled_df"],
-        "unlabeled_pool_df": data_bundle["unlabeled_pool_df"],
-        "y_all": data_bundle["y_all"],
+    print(f"\n===== IMAGE POOL MANAGER: ROUND {round_id} UPDATE =====")
+    print("Newly added images:", len(selected))
+    print("Total labeled:", len(updated_labeled_df))
+    print("Total unlabeled:", len(remaining_unlabeled_df))
 
-        # pool state
-        "pool_state": pool_state,
-        "pool_labeled_df": pool_state["labeled_df"],
-        "pool_unlabeled_df": pool_state["unlabeled_df"],
-        "pool_val_df": pool_state["val_df"],
-        "pool_test_df": pool_state["test_df"],
-        "pool_paths": pool_state["paths"],
-
-        # metadata
-        "metadata_path": metadata_path,
+    return {
+        "updated_labeled_df": updated_labeled_df,
+        "remaining_unlabeled_df": remaining_unlabeled_df,
+        "selected_df": selected,
+        "round_dir": round_dir,
+        "summary": summary,
     }
 
-    print("\n===== IMAGE-LEVEL DATA PIPELINE =====")
-    print("Project root:", pipeline_bundle["project_root"])
-    print("Dataset root:", pipeline_bundle["dataset_root"])
-    print("Train CSV:", pipeline_bundle["train_csv"])
-    print("Train dir:", pipeline_bundle["train_dir"])
-    print("Test dir:", pipeline_bundle["test_dir"])
-    print("Reports dir:", pipeline_bundle["reports_dir"])
-    print("Metadata path:", pipeline_bundle["metadata_path"])
 
-    print("\n--- Image-level shapes ---")
-    print("Train:", pipeline_bundle["train_df"].shape)
-    print("Train pool:", pipeline_bundle["train_pool_df"].shape)
-    print("Validation:", pipeline_bundle["val_df"].shape)
-    print("Test:", pipeline_bundle["test_df"].shape)
-    print("Initial labeled:", pipeline_bundle["initial_labeled_df"].shape)
-    print("Unlabeled pool:", pipeline_bundle["unlabeled_pool_df"].shape)
+def save_round_metrics(
+    round_id: int,
+    metrics: Dict,
+    annotations_dir: str = ANNOTATIONS_DIR,
+    filename: str = "metrics.json",
+):
+    dirs = ensure_pool_manager_directories(annotations_dir)
+    round_dir = os.path.join(dirs["rounds_dir"], f"round_{round_id:02d}")
+    os.makedirs(round_dir, exist_ok=True)
 
-    print("\n--- Pool state ---")
-    print("Pool labeled:", pipeline_bundle["pool_labeled_df"].shape)
-    print("Pool unlabeled:", pipeline_bundle["pool_unlabeled_df"].shape)
-
-    return pipeline_bundle
+    metrics_path = os.path.join(round_dir, filename)
+    _save_json(metrics, metrics_path)
+    return metrics_path
