@@ -6,12 +6,14 @@ def main():
     try:
         print("\n===== STARTING FULL PIPELINE =====")
 
+        # 1) Data pipeline
         pipeline_bundle = run_data_pipeline()
 
         print("\n===== DATA PIPELINE FINISHED =====")
         print("Reports dir:", pipeline_bundle["reports_dir"])
         print("Metadata path:", pipeline_bundle["metadata_path"])
 
+        # 2) Model pipeline
         model_outputs = run_model_pipeline(pipeline_bundle)
 
         print("\n===== MODEL PIPELINE FINISHED =====")

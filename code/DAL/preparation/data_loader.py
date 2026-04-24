@@ -1,5 +1,4 @@
 import os
-import ast
 from typing import Dict
 
 import cv2
@@ -16,9 +15,10 @@ from DAL.preparation.config import (
     IMG_SIZE,
     BATCH_SIZE,
     NUM_WORKERS,
-    LESION_CONTEXT_PAD_RATIO,
-    USE_SAVED_LESION_CROPS,
+    MAX_PATCHES,
 )
+from DAL.preparation.lesion_utils import extract_lesion_candidates
+
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
@@ -49,29 +49,15 @@ def get_eval_transforms(img_size: int = IMG_SIZE):
     ])
 
 
-def _safe_literal_list(value):
+def _safe_label_list(value):
     if isinstance(value, list):
         return [str(x) for x in value]
-
     if value is None:
         return []
-
     if isinstance(value, float) and np.isnan(value):
         return []
-
     text = str(value).strip()
-    if not text:
-        return []
-
-    if text.startswith("[") and text.endswith("]"):
-        try:
-            parsed = ast.literal_eval(text)
-            if isinstance(parsed, list):
-                return [str(x) for x in parsed]
-        except Exception:
-            pass
-
-    return text.split()
+    return text.split() if text else []
 
 
 def _one_hot_from_label_list(label_list, all_labels):
@@ -83,31 +69,8 @@ def _one_hot_from_label_list(label_list, all_labels):
 
 
 def _target_from_row(row: pd.Series, all_labels):
-    """
-    Priority:
-    1) lesion-level annotation_label
-    2) lesion_label
-    3) encoded image-level columns y_*
-    4) label_list / labels fallback
-    """
-
-    if "annotation_label" in row.index:
-        ann = row["annotation_label"]
-        if ann is not None and not (isinstance(ann, float) and np.isnan(ann)) and str(ann).strip() != "":
-            return torch.tensor(
-                _one_hot_from_label_list([str(ann)], all_labels),
-                dtype=torch.float32,
-            )
-
-    if "lesion_label" in row.index:
-        ann = row["lesion_label"]
-        if ann is not None and not (isinstance(ann, float) and np.isnan(ann)) and str(ann).strip() != "":
-            return torch.tensor(
-                _one_hot_from_label_list([str(ann)], all_labels),
-                dtype=torch.float32,
-            )
-
     encoded_cols = [f"y_{cls}" for cls in all_labels]
+
     if all(col in row.index for col in encoded_cols):
         return torch.tensor(
             [float(row[col]) for col in encoded_cols],
@@ -116,144 +79,109 @@ def _target_from_row(row: pd.Series, all_labels):
 
     if "label_list" in row.index:
         return torch.tensor(
-            _one_hot_from_label_list(_safe_literal_list(row["label_list"]), all_labels),
+            _one_hot_from_label_list(_safe_label_list(row["label_list"]), all_labels),
             dtype=torch.float32,
         )
 
     if "labels" in row.index:
         return torch.tensor(
-            _one_hot_from_label_list(_safe_literal_list(row["labels"]), all_labels),
+            _one_hot_from_label_list(_safe_label_list(row["labels"]), all_labels),
             dtype=torch.float32,
         )
 
     return torch.zeros(len(all_labels), dtype=torch.float32)
 
 
-def _has_annotation(row: pd.Series) -> bool:
-    for key in ["annotation_label", "lesion_label"]:
-        if key in row.index:
-            value = row[key]
-            if value is not None and not (isinstance(value, float) and np.isnan(value)) and str(value).strip() != "":
-                return True
-
-    if "is_annotated" in row.index:
-        value = row["is_annotated"]
-        if isinstance(value, str):
-            return value.lower() in {"1", "true", "yes"}
-        return bool(value)
-
-    return False
+def _patch_rgb_to_pil(patch_rgb: np.ndarray) -> Image.Image:
+    patch_uint8 = (np.clip(patch_rgb, 0, 1) * 255).astype(np.uint8)
+    return Image.fromarray(patch_uint8)
 
 
-class LesionDataset(Dataset):
+class ImagePatchDataset(Dataset):
     """
-    Required manifest columns:
-    - image
-    - x1, y1, x2, y2
-
-    Optional columns:
-    - lesion_id
-    - crop_path
-    - annotation_label
-    - lesion_label
-    - label_list / labels
-    - is_annotated
-    - split
-    - pool
+    Image-level dataset:
+    - reads one full image
+    - extracts 1..K lesion patches on-the-fly
+    - returns fixed-size patch tensor stack [K, 3, H, W]
+    - returns image-level multi-label target
     """
 
     def __init__(
         self,
-        manifest_df: pd.DataFrame,
+        image_df: pd.DataFrame,
         image_root: str,
         transform=None,
         all_labels=None,
         return_targets: bool = True,
-        include_context_pad_ratio: float = LESION_CONTEXT_PAD_RATIO,
+        max_patches: int = MAX_PATCHES,
     ):
-        self.df = manifest_df.reset_index(drop=True).copy()
+        self.df = image_df.reset_index(drop=True).copy()
         self.image_root = image_root
         self.transform = transform if transform is not None else get_eval_transforms()
         self.all_labels = all_labels if all_labels is not None else ALL_LABELS
         self.return_targets = return_targets
-        self.include_context_pad_ratio = include_context_pad_ratio
-        self.use_saved_lesion_crops = USE_SAVED_LESION_CROPS
+        self.max_patches = max_patches
 
-        required = {"image", "x1", "y1", "x2", "y2"}
-        missing = required - set(self.df.columns)
-        if missing:
-            raise ValueError(f"Manifest is missing required columns: {sorted(missing)}")
+        if "image" not in self.df.columns:
+            raise ValueError("image_df must contain 'image' column.")
 
     def __len__(self):
         return len(self.df)
 
-    def _read_full_image(self, image_name: str):
+    def _read_image(self, image_name: str):
         image_path = os.path.join(self.image_root, str(image_name))
         image_bgr = cv2.imread(image_path)
         if image_bgr is None:
             raise FileNotFoundError(f"Could not read image: {image_path}")
         return image_bgr, image_path
 
-    def _read_crop_from_disk(self, crop_path: str):
-        image_bgr = cv2.imread(crop_path)
-        if image_bgr is None:
-            raise FileNotFoundError(f"Could not read crop image: {crop_path}")
-        return image_bgr
+    def _build_patch_stack(self, image_bgr):
+        patches_rgb, boxes, lesion_mask = extract_lesion_candidates(
+            image_bgr=image_bgr,
+            max_patches=self.max_patches,
+        )
 
-    def _crop_from_row(self, row: pd.Series):
-        if self.use_saved_lesion_crops and "crop_path" in row.index:
-            crop_path = row["crop_path"]
-            if crop_path is not None and str(crop_path).strip() != "" and os.path.exists(str(crop_path)):
-                crop_bgr = self._read_crop_from_disk(str(crop_path))
-                crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-                return Image.fromarray(crop_rgb), str(crop_path), None
+        patch_tensors = []
+        patch_boxes = []
+        patch_mask = []
 
-        image_bgr, image_path = self._read_full_image(row["image"])
-        h, w = image_bgr.shape[:2]
+        for patch_rgb, box in zip(patches_rgb, boxes):
+            patch_pil = _patch_rgb_to_pil(patch_rgb)
+            patch_tensor = self.transform(patch_pil)
 
-        x1 = int(row["x1"])
-        y1 = int(row["y1"])
-        x2 = int(row["x2"])
-        y2 = int(row["y2"])
+            patch_tensors.append(patch_tensor)
+            patch_boxes.append(torch.tensor(box, dtype=torch.int64))
+            patch_mask.append(1)
 
-        bw = max(1, x2 - x1)
-        bh = max(1, y2 - y1)
+        while len(patch_tensors) < self.max_patches:
+            patch_tensors.append(torch.zeros((3, IMG_SIZE, IMG_SIZE), dtype=torch.float32))
+            patch_boxes.append(torch.tensor([-1, -1, -1, -1], dtype=torch.int64))
+            patch_mask.append(0)
 
-        pad_x = int(self.include_context_pad_ratio * bw)
-        pad_y = int(self.include_context_pad_ratio * bh)
+        patch_stack = torch.stack(patch_tensors, dim=0)            # [K, 3, H, W]
+        patch_boxes = torch.stack(patch_boxes, dim=0)              # [K, 4]
+        patch_mask = torch.tensor(patch_mask, dtype=torch.float32) # [K]
 
-        x1 = max(0, x1 - pad_x)
-        y1 = max(0, y1 - pad_y)
-        x2 = min(w, x2 + pad_x)
-        y2 = min(h, y2 + pad_y)
+        lesion_mask_tensor = torch.from_numpy(lesion_mask.astype(np.uint8))
 
-        crop_bgr = image_bgr[y1:y2, x1:x2]
-        crop_rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
-
-        return Image.fromarray(crop_rgb), image_path, (x1, y1, x2, y2)
+        return patch_stack, patch_boxes, patch_mask, lesion_mask_tensor, len(patches_rgb)
 
     def __getitem__(self, idx):
         row = self.df.iloc[idx]
+        image_name = row["image"]
 
-        image_pil, source_path, effective_box = self._crop_from_row(row)
-        image_tensor = self.transform(image_pil)
+        image_bgr, image_path = self._read_image(image_name)
+        patch_stack, patch_boxes, patch_mask, lesion_mask_tensor, num_valid_patches = self._build_patch_stack(image_bgr)
 
         item = {
-            "image": image_tensor,
-            "lesion_id": row["lesion_id"] if "lesion_id" in row.index else f"lesion_{idx}",
-            "image_name": row["image"],
-            "source_path": source_path,
-            "x1": int(row["x1"]),
-            "y1": int(row["y1"]),
-            "x2": int(row["x2"]),
-            "y2": int(row["y2"]),
-            "has_annotation": _has_annotation(row),
+            "patches": patch_stack,
+            "patch_boxes": patch_boxes,
+            "patch_mask": patch_mask,
+            "lesion_mask": lesion_mask_tensor,
+            "num_valid_patches": int(num_valid_patches),
+            "image_name": image_name,
+            "source_path": image_path,
         }
-
-        if effective_box is None:
-            item["effective_crop_box"] = torch.tensor([-1, -1, -1, -1], dtype=torch.int64)
-        else:
-            item["effective_crop_box"] = torch.tensor(effective_box, dtype=torch.int64)
 
         if self.return_targets:
             item["target"] = _target_from_row(row, self.all_labels)
@@ -262,7 +190,7 @@ class LesionDataset(Dataset):
 
 
 def make_loader(
-    manifest_df: pd.DataFrame,
+    image_df: pd.DataFrame,
     image_root: str,
     batch_size: int = BATCH_SIZE,
     shuffle: bool = False,
@@ -271,8 +199,8 @@ def make_loader(
     all_labels=None,
     return_targets: bool = True,
 ):
-    dataset = LesionDataset(
-        manifest_df=manifest_df,
+    dataset = ImagePatchDataset(
+        image_df=image_df,
         image_root=image_root,
         transform=get_train_transforms() if train_mode else get_eval_transforms(),
         all_labels=all_labels if all_labels is not None else ALL_LABELS,
@@ -289,31 +217,19 @@ def make_loader(
     return loader
 
 
-def create_lesion_dataloaders(
-    manifest_bundle: Dict[str, pd.DataFrame],
-    data_bundle: Dict,
+def create_image_patch_dataloaders(
+    pipeline_bundle: Dict,
     batch_size: int = BATCH_SIZE,
     num_workers: int = NUM_WORKERS,
 ):
-    """
-    Expected manifest_bundle keys:
-    - labeled_lesions_df
-    - unlabeled_lesions_df
-    - val_lesions_df
-    - test_lesions_df
-
-    data_bundle must contain:
-    - train_dir
-    - all_labels
-    """
-    image_root = data_bundle["train_dir"]
-    all_labels = data_bundle["all_labels"]
+    image_root = pipeline_bundle["train_dir"]
+    all_labels = pipeline_bundle["all_labels"]
 
     loaders = {}
 
-    if "labeled_lesions_df" in manifest_bundle and len(manifest_bundle["labeled_lesions_df"]) > 0:
+    if "pool_labeled_df" in pipeline_bundle and len(pipeline_bundle["pool_labeled_df"]) > 0:
         loaders["train"] = make_loader(
-            manifest_df=manifest_bundle["labeled_lesions_df"],
+            image_df=pipeline_bundle["pool_labeled_df"],
             image_root=image_root,
             batch_size=batch_size,
             shuffle=True,
@@ -323,9 +239,9 @@ def create_lesion_dataloaders(
             return_targets=True,
         )
 
-    if "unlabeled_lesions_df" in manifest_bundle and len(manifest_bundle["unlabeled_lesions_df"]) > 0:
+    if "pool_unlabeled_df" in pipeline_bundle and len(pipeline_bundle["pool_unlabeled_df"]) > 0:
         loaders["unlabeled"] = make_loader(
-            manifest_df=manifest_bundle["unlabeled_lesions_df"],
+            image_df=pipeline_bundle["pool_unlabeled_df"],
             image_root=image_root,
             batch_size=batch_size,
             shuffle=False,
@@ -335,9 +251,9 @@ def create_lesion_dataloaders(
             return_targets=False,
         )
 
-    if "val_lesions_df" in manifest_bundle and len(manifest_bundle["val_lesions_df"]) > 0:
+    if "pool_val_df" in pipeline_bundle and len(pipeline_bundle["pool_val_df"]) > 0:
         loaders["val"] = make_loader(
-            manifest_df=manifest_bundle["val_lesions_df"],
+            image_df=pipeline_bundle["pool_val_df"],
             image_root=image_root,
             batch_size=batch_size,
             shuffle=False,
@@ -347,9 +263,9 @@ def create_lesion_dataloaders(
             return_targets=True,
         )
 
-    if "test_lesions_df" in manifest_bundle and len(manifest_bundle["test_lesions_df"]) > 0:
+    if "pool_test_df" in pipeline_bundle and len(pipeline_bundle["pool_test_df"]) > 0:
         loaders["test"] = make_loader(
-            manifest_df=manifest_bundle["test_lesions_df"],
+            image_df=pipeline_bundle["pool_test_df"],
             image_root=image_root,
             batch_size=batch_size,
             shuffle=False,
@@ -360,38 +276,3 @@ def create_lesion_dataloaders(
         )
 
     return loaders
-
-
-def load_manifest_csv(csv_path: str) -> pd.DataFrame:
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Missing manifest CSV: {csv_path}")
-    return pd.read_csv(csv_path)
-
-
-def create_lesion_dataloaders_from_csvs(
-    csv_paths: Dict[str, str],
-    data_bundle: Dict,
-    batch_size: int = BATCH_SIZE,
-    num_workers: int = NUM_WORKERS,
-):
-    """
-    Example csv_paths:
-    {
-        "labeled_lesions_df": ".../labeled_lesions.csv",
-        "unlabeled_lesions_df": ".../unlabeled_lesions.csv",
-        "val_lesions_df": ".../val_lesions.csv",
-        "test_lesions_df": ".../test_lesions.csv",
-    }
-    """
-    manifest_bundle = {
-        key: load_manifest_csv(path)
-        for key, path in csv_paths.items()
-        if path is not None
-    }
-
-    return create_lesion_dataloaders(
-        manifest_bundle=manifest_bundle,
-        data_bundle=data_bundle,
-        batch_size=batch_size,
-        num_workers=num_workers,
-    )

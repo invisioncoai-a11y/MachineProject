@@ -20,16 +20,11 @@ from DAL.preparation.split_data import (
     save_split_csvs,
 )
 
-from DAL.preparation.lesion_manifest import (
-    build_lesion_manifest_bundle,
-)
-
 from DAL.preparation.pool_manager import (
-    initialize_pool_state_from_manifest_bundle,
+    initialize_image_pool_state_from_split_bundle,
 )
 
 from DAL.eda.explore_dataset import run_eda_pipeline
-from DAL.eda.explore_lesions import run_lesion_eda_pipeline
 
 
 def _shape_or_empty(df):
@@ -40,7 +35,6 @@ def _shape_or_empty(df):
 
 def _save_metadata(
     data_bundle: dict,
-    lesion_bundle: dict,
     pool_state: dict,
     reports_dir: str,
 ):
@@ -69,17 +63,6 @@ def _save_metadata(
             "sample_df": _shape_or_empty(data_bundle.get("sample_df")),
         },
 
-        "lesion_level_shapes": {
-            "train_pool_lesions_df": _shape_or_empty(lesion_bundle.get("train_pool_lesions_df")),
-            "labeled_lesions_df": _shape_or_empty(lesion_bundle.get("labeled_lesions_df")),
-            "unlabeled_lesions_df": _shape_or_empty(lesion_bundle.get("unlabeled_lesions_df")),
-            "val_lesions_df": _shape_or_empty(lesion_bundle.get("val_lesions_df")),
-            "test_lesions_df": _shape_or_empty(lesion_bundle.get("test_lesions_df")),
-        },
-
-        "lesion_csv_paths": lesion_bundle.get("csv_paths", {}),
-        "lesion_summary": lesion_bundle.get("summary", {}),
-
         "pool_state_summary": pool_state.get("summary", {}),
         "pool_paths": pool_state.get("paths", {}),
     }
@@ -92,7 +75,7 @@ def _save_metadata(
 
 def run_data_pipeline():
     """
-    Full data-stage pipeline:
+    Image-level data pipeline only.
 
     1) Ensure report directories
     2) Resolve dataset paths
@@ -102,12 +85,10 @@ def run_data_pipeline():
     6) Create image-level splits
     7) Save image-level split CSVs
     8) Run image-level EDA
-    9) Build lesion manifests from image-level splits
-    10) Run lesion-level EDA
-    11) Initialize labeled/unlabeled lesion pool state
-    12) Save combined metadata
+    9) Initialize image-level active learning pool state
+    10) Save combined metadata
 
-    Returns a single bundle that RUN.py can consume later.
+    Returns a single pipeline bundle for RUN.py / model pipeline.
     """
     ensure_report_directories()
 
@@ -161,26 +142,10 @@ def run_data_pipeline():
     run_eda_pipeline(data_bundle)
 
     # -------------------------
-    # Lesion-level manifest generation
+    # Initialize image-level pool state
     # -------------------------
-    lesion_bundle = build_lesion_manifest_bundle(
-        data_bundle=data_bundle,
-        reports_dir=REPORTS_DIR,
-    )
-
-    # -------------------------
-    # Lesion-level EDA
-    # -------------------------
-    run_lesion_eda_pipeline(
-        lesion_bundle=lesion_bundle,
-        reports_dir=REPORTS_DIR,
-    )
-
-    # -------------------------
-    # Initialize lesion pool state
-    # -------------------------
-    pool_state = initialize_pool_state_from_manifest_bundle(
-        manifest_bundle=lesion_bundle,
+    pool_state = initialize_image_pool_state_from_split_bundle(
+        split_bundle=split_bundle,
     )
 
     # -------------------------
@@ -188,7 +153,6 @@ def run_data_pipeline():
     # -------------------------
     metadata_path = _save_metadata(
         data_bundle=data_bundle,
-        lesion_bundle=lesion_bundle,
         pool_state=pool_state,
         reports_dir=REPORTS_DIR,
     )
@@ -217,17 +181,6 @@ def run_data_pipeline():
         "unlabeled_pool_df": data_bundle["unlabeled_pool_df"],
         "y_all": data_bundle["y_all"],
 
-        # lesion-level bundle
-        "lesion_bundle": lesion_bundle,
-        "train_pool_lesions_df": lesion_bundle["train_pool_lesions_df"],
-        "labeled_lesions_df": lesion_bundle["labeled_lesions_df"],
-        "unlabeled_lesions_df": lesion_bundle["unlabeled_lesions_df"],
-        "val_lesions_df": lesion_bundle["val_lesions_df"],
-        "test_lesions_df": lesion_bundle["test_lesions_df"],
-        "lesion_csv_paths": lesion_bundle["csv_paths"],
-        "lesion_summary": lesion_bundle["summary"],
-        "lesion_summary_path": lesion_bundle["summary_path"],
-
         # pool state
         "pool_state": pool_state,
         "pool_labeled_df": pool_state["labeled_df"],
@@ -240,7 +193,7 @@ def run_data_pipeline():
         "metadata_path": metadata_path,
     }
 
-    print("\n===== FULL DATA PIPELINE =====")
+    print("\n===== IMAGE-LEVEL DATA PIPELINE =====")
     print("Project root:", pipeline_bundle["project_root"])
     print("Dataset root:", pipeline_bundle["dataset_root"])
     print("Train CSV:", pipeline_bundle["train_csv"])
@@ -256,13 +209,6 @@ def run_data_pipeline():
     print("Test:", pipeline_bundle["test_df"].shape)
     print("Initial labeled:", pipeline_bundle["initial_labeled_df"].shape)
     print("Unlabeled pool:", pipeline_bundle["unlabeled_pool_df"].shape)
-
-    print("\n--- Lesion-level shapes ---")
-    print("Train pool lesions:", pipeline_bundle["train_pool_lesions_df"].shape)
-    print("Labeled lesions:", pipeline_bundle["labeled_lesions_df"].shape)
-    print("Unlabeled lesions:", pipeline_bundle["unlabeled_lesions_df"].shape)
-    print("Val lesions:", pipeline_bundle["val_lesions_df"].shape)
-    print("Test lesions:", pipeline_bundle["test_lesions_df"].shape)
 
     print("\n--- Pool state ---")
     print("Pool labeled:", pipeline_bundle["pool_labeled_df"].shape)
