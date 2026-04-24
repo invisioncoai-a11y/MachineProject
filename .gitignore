@@ -1,0 +1,10 @@
+code/.venv/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.vscode/
+code/DAL/reports/
+code/Plots/
+*.log
