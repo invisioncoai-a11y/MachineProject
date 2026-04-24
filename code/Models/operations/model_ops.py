@@ -72,7 +72,7 @@ def build_scheduler(optimizer):
         mode="max",
         factor=0.5,
         patience=2,
-        verbose=True,
+        # verbose=True,
     )
 
 
