@@ -54,13 +54,100 @@ def _attach_encoded_columns(
     return out
 
 
+# def create_data_splits(train_df: pd.DataFrame, y_all: np.ndarray, seed: int = 42):
+#     class_names = list(ALL_LABELS)
+
+#     stratify_full = _safe_stratify_series(train_df["label_combo"])
+
+#     idx_all = np.arange(len(train_df))
+#     idx_train_pool, idx_test = train_test_split(
+#         idx_all,
+#         test_size=TEST_RATIO,
+#         random_state=seed,
+#         shuffle=True,
+#         stratify=stratify_full if stratify_full is not None else None,
+#     )
+
+#     train_pool_df = train_df.iloc[idx_train_pool].reset_index(drop=True)
+#     test_df = train_df.iloc[idx_test].reset_index(drop=True)
+
+#     y_train_pool = y_all[idx_train_pool]
+#     y_test = y_all[idx_test]
+
+#     relative_val_ratio = VAL_RATIO / (1.0 - TEST_RATIO)
+#     stratify_train_pool = _safe_stratify_series(train_pool_df["label_combo"])
+
+#     idx_pool = np.arange(len(train_pool_df))
+#     idx_train_final, idx_val = train_test_split(
+#         idx_pool,
+#         test_size=relative_val_ratio,
+#         random_state=seed,
+#         shuffle=True,
+#         stratify=stratify_train_pool if stratify_train_pool is not None else None,
+#     )
+
+#     final_train_df = train_pool_df.iloc[idx_train_final].reset_index(drop=True)
+#     val_df = train_pool_df.iloc[idx_val].reset_index(drop=True)
+
+#     y_final_train = y_train_pool[idx_train_final]
+#     y_val = y_train_pool[idx_val]
+
+#     stratify_final_train = _safe_stratify_series(final_train_df["label_combo"])
+#     idx_final = np.arange(len(final_train_df))
+
+#     initial_label_count = max(1, int(round(INITIAL_LABEL_RATIO * len(final_train_df))))
+
+#     if initial_label_count >= len(final_train_df):
+#         idx_initial_labeled = idx_final
+#         idx_unlabeled = np.array([], dtype=int)
+#     else:
+#         idx_initial_labeled, idx_unlabeled = train_test_split(
+#             idx_final,
+#             train_size=initial_label_count,
+#             random_state=seed,
+#             shuffle=True,
+#             stratify=stratify_final_train if stratify_final_train is not None else None,
+#         )
+
+#     initial_labeled_df = final_train_df.iloc[idx_initial_labeled].reset_index(drop=True)
+#     unlabeled_pool_df = final_train_df.iloc[idx_unlabeled].reset_index(drop=True)
+
+#     y_initial_labeled = y_final_train[idx_initial_labeled]
+#     y_unlabeled_pool = y_final_train[idx_unlabeled]
+
+#     train_df_encoded = _attach_encoded_columns(train_df, y_all, class_names)
+#     train_pool_df_encoded = _attach_encoded_columns(train_pool_df, y_train_pool, class_names)
+#     val_df_encoded = _attach_encoded_columns(val_df, y_val, class_names)
+#     test_df_encoded = _attach_encoded_columns(test_df, y_test, class_names)
+#     initial_labeled_df_encoded = _attach_encoded_columns(
+#         initial_labeled_df, y_initial_labeled, class_names
+#     )
+#     unlabeled_pool_df_encoded = _attach_encoded_columns(
+#         unlabeled_pool_df, y_unlabeled_pool, class_names
+#     )
+
+#     return {
+#         "train_df": train_df_encoded,
+#         "train_pool_df": train_pool_df_encoded,
+#         "val_df": val_df_encoded,
+#         "test_df": test_df_encoded,
+#         "initial_labeled_df": initial_labeled_df_encoded,
+#         "unlabeled_pool_df": unlabeled_pool_df_encoded,
+#         "y_all": y_all,
+#     }
+
 def create_data_splits(train_df: pd.DataFrame, y_all: np.ndarray, seed: int = 42):
     class_names = list(ALL_LABELS)
 
+    # ============================================================
+    # 1) Split TEST from the full dataset
+    #    Test = TEST_RATIO من كامل الداتا
+    # ============================================================
     stratify_full = _safe_stratify_series(train_df["label_combo"])
 
     idx_all = np.arange(len(train_df))
-    idx_train_pool, idx_test = train_test_split(
+
+    idx_remaining, idx_test = train_test_split(
         idx_all,
         test_size=TEST_RATIO,
         random_state=seed,
@@ -68,62 +155,103 @@ def create_data_splits(train_df: pd.DataFrame, y_all: np.ndarray, seed: int = 42
         stratify=stratify_full if stratify_full is not None else None,
     )
 
-    train_pool_df = train_df.iloc[idx_train_pool].reset_index(drop=True)
+    remaining_df = train_df.iloc[idx_remaining].reset_index(drop=True)
     test_df = train_df.iloc[idx_test].reset_index(drop=True)
 
-    y_train_pool = y_all[idx_train_pool]
+    y_remaining = y_all[idx_remaining]
     y_test = y_all[idx_test]
 
+    # ============================================================
+    # 2) Split VALIDATION from the remaining data
+    #    بحيث تكون validation = VAL_RATIO من كامل الداتا
+    # ============================================================
     relative_val_ratio = VAL_RATIO / (1.0 - TEST_RATIO)
-    stratify_train_pool = _safe_stratify_series(train_pool_df["label_combo"])
 
-    idx_pool = np.arange(len(train_pool_df))
-    idx_train_final, idx_val = train_test_split(
-        idx_pool,
+    stratify_remaining = _safe_stratify_series(remaining_df["label_combo"])
+
+    idx_remaining_local = np.arange(len(remaining_df))
+
+    idx_active_train_pool, idx_val = train_test_split(
+        idx_remaining_local,
         test_size=relative_val_ratio,
         random_state=seed,
         shuffle=True,
-        stratify=stratify_train_pool if stratify_train_pool is not None else None,
+        stratify=stratify_remaining if stratify_remaining is not None else None,
     )
 
-    final_train_df = train_pool_df.iloc[idx_train_final].reset_index(drop=True)
-    val_df = train_pool_df.iloc[idx_val].reset_index(drop=True)
+    active_train_pool_df = remaining_df.iloc[idx_active_train_pool].reset_index(drop=True)
+    val_df = remaining_df.iloc[idx_val].reset_index(drop=True)
 
-    y_final_train = y_train_pool[idx_train_final]
-    y_val = y_train_pool[idx_val]
+    y_active_train_pool = y_remaining[idx_active_train_pool]
+    y_val = y_remaining[idx_val]
 
-    stratify_final_train = _safe_stratify_series(final_train_df["label_combo"])
-    idx_final = np.arange(len(final_train_df))
+    # ============================================================
+    # 3) Initial labeled = 5% من كامل الداتا، مش من active_train_pool
+    # ============================================================
+    full_dataset_size = len(train_df)
 
-    initial_label_count = max(1, int(round(INITIAL_LABEL_RATIO * len(final_train_df))))
+    desired_initial_label_count = int(round(INITIAL_LABEL_RATIO * full_dataset_size))
+    initial_label_count = max(
+        1,
+        min(desired_initial_label_count, len(active_train_pool_df))
+    )
 
-    if initial_label_count >= len(final_train_df):
-        idx_initial_labeled = idx_final
+    stratify_active_train_pool = _safe_stratify_series(
+        active_train_pool_df["label_combo"]
+    )
+
+    idx_active = np.arange(len(active_train_pool_df))
+
+    if initial_label_count >= len(active_train_pool_df):
+        idx_initial_labeled = idx_active
         idx_unlabeled = np.array([], dtype=int)
     else:
         idx_initial_labeled, idx_unlabeled = train_test_split(
-            idx_final,
+            idx_active,
             train_size=initial_label_count,
             random_state=seed,
             shuffle=True,
-            stratify=stratify_final_train if stratify_final_train is not None else None,
+            stratify=(
+                stratify_active_train_pool
+                if stratify_active_train_pool is not None
+                else None
+            ),
         )
 
-    initial_labeled_df = final_train_df.iloc[idx_initial_labeled].reset_index(drop=True)
-    unlabeled_pool_df = final_train_df.iloc[idx_unlabeled].reset_index(drop=True)
+    initial_labeled_df = active_train_pool_df.iloc[idx_initial_labeled].reset_index(drop=True)
+    unlabeled_pool_df = active_train_pool_df.iloc[idx_unlabeled].reset_index(drop=True)
 
-    y_initial_labeled = y_final_train[idx_initial_labeled]
-    y_unlabeled_pool = y_final_train[idx_unlabeled]
+    y_initial_labeled = y_active_train_pool[idx_initial_labeled]
+    y_unlabeled_pool = y_active_train_pool[idx_unlabeled]
 
+    # ============================================================
+    # 4) Attach encoded y_* columns
+    # ============================================================
     train_df_encoded = _attach_encoded_columns(train_df, y_all, class_names)
-    train_pool_df_encoded = _attach_encoded_columns(train_pool_df, y_train_pool, class_names)
+
+    # مهم:
+    # train_pool_df هون صار يعني active learning train pool فقط
+    # يعني initial_labeled + unlabeled_pool
+    # وما فيه validation ولا test
+    train_pool_df_encoded = _attach_encoded_columns(
+        active_train_pool_df,
+        y_active_train_pool,
+        class_names,
+    )
+
     val_df_encoded = _attach_encoded_columns(val_df, y_val, class_names)
     test_df_encoded = _attach_encoded_columns(test_df, y_test, class_names)
+
     initial_labeled_df_encoded = _attach_encoded_columns(
-        initial_labeled_df, y_initial_labeled, class_names
+        initial_labeled_df,
+        y_initial_labeled,
+        class_names,
     )
+
     unlabeled_pool_df_encoded = _attach_encoded_columns(
-        unlabeled_pool_df, y_unlabeled_pool, class_names
+        unlabeled_pool_df,
+        y_unlabeled_pool,
+        class_names,
     )
 
     return {
@@ -135,6 +263,7 @@ def create_data_splits(train_df: pd.DataFrame, y_all: np.ndarray, seed: int = 42
         "unlabeled_pool_df": unlabeled_pool_df_encoded,
         "y_all": y_all,
     }
+
 
 
 def save_split_csvs(split_bundle: dict, reports_dir: str):

@@ -159,6 +159,77 @@ def _plot_history(history_df: pd.DataFrame, plots_dir: str):
     plt.close()
 
 
+def _compute_pos_weights_from_df(
+    train_df: pd.DataFrame,
+    class_names,
+    device,
+    use_sqrt: bool = True,
+    max_weight: float = 10.0,
+):
+    """
+    Compute multi-label BCE pos_weight from the labeled training set only.
+
+    pos_weight[c] = negative_count[c] / positive_count[c]
+
+    Important:
+    - Use only training/labeled data.
+    - Do not use validation or test data to avoid data leakage.
+    - sqrt is used to soften very large weights.
+    """
+    encoded_cols = [f"y_{cls}" for cls in class_names]
+
+    if train_df is None or len(train_df) == 0:
+        weights = np.ones(len(class_names), dtype=np.float32)
+        summary = {
+            cls: {
+                "positive_count": 0,
+                "negative_count": 0,
+                "raw_pos_weight": 1.0,
+                "used_pos_weight": 1.0,
+            }
+            for cls in class_names
+        }
+        return torch.tensor(weights, dtype=torch.float32, device=device), summary
+
+    missing_cols = [col for col in encoded_cols if col not in train_df.columns]
+    if missing_cols:
+        raise ValueError(f"Missing encoded label columns for class weights: {missing_cols}")
+
+    targets = train_df[encoded_cols].values.astype(np.float32)
+
+    pos_counts = targets.sum(axis=0)
+    total_count = targets.shape[0]
+    neg_counts = total_count - pos_counts
+
+    raw_weights = np.ones_like(pos_counts, dtype=np.float32)
+
+    valid_mask = pos_counts > 0
+    raw_weights[valid_mask] = neg_counts[valid_mask] / (pos_counts[valid_mask] + 1e-6)
+
+    # إذا كلاس ما ظهر بالتدريب، ما نعطيه وزن ضخم حتى ما يخرب التدريب
+    raw_weights[~valid_mask] = 1.0
+
+    # لا نخلي الوزن أقل من 1، حتى ما نقلل أهمية الكلاسات
+    raw_weights = np.maximum(raw_weights, 1.0)
+
+    if use_sqrt:
+        used_weights = np.sqrt(raw_weights)
+    else:
+        used_weights = raw_weights
+
+    used_weights = np.clip(used_weights, 1.0, max_weight).astype(np.float32)
+
+    summary = {}
+    for i, cls in enumerate(class_names):
+        summary[cls] = {
+            "positive_count": int(pos_counts[i]),
+            "negative_count": int(neg_counts[i]),
+            "raw_pos_weight": float(raw_weights[i]),
+            "used_pos_weight": float(used_weights[i]),
+        }
+
+    return torch.tensor(used_weights, dtype=torch.float32, device=device), summary
+
 def _compute_multilabel_metrics(y_true, y_prob, class_names, threshold=THRESHOLD):
     y_true = np.asarray(y_true).astype(int)
     y_prob = np.asarray(y_prob).astype(np.float32)
@@ -239,11 +310,14 @@ def _run_one_epoch(
     class_names,
     optimizer=None,
     threshold=THRESHOLD,
+    bce_criterion=None,
 ):
     is_train = optimizer is not None
     model.train() if is_train else model.eval()
 
-    bce_criterion = nn.BCEWithLogitsLoss()
+    if bce_criterion is None:
+        bce_criterion = nn.BCEWithLogitsLoss()
+    bce_criterion = bce_criterion.to(device)
 
     running_loss = 0.0
     running_main_loss = 0.0
@@ -423,6 +497,44 @@ def run_model_pipeline(pipeline_bundle: dict):
     best_ckpt_path = os.path.join(dirs["ckpt_dir"], "best_model.pt")
     last_ckpt_path = os.path.join(dirs["ckpt_dir"], "last_model.pt")
 
+    # ============================================================
+    # Class weights for multi-label imbalance
+    # Compute from labeled training set only
+    # ============================================================
+    train_df_for_weights = pipeline_bundle.get("pool_labeled_df", None)
+
+    pos_weights, class_weight_summary = _compute_pos_weights_from_df(
+        train_df=train_df_for_weights,
+        class_names=class_names,
+        device=device,
+        use_sqrt=True,
+        max_weight=10.0,
+    )
+
+    bce_criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weights)
+
+    class_weights_path = os.path.join(dirs["metrics_dir"], "class_weights_round_00.json")
+    _save_json(
+        {
+            "method": "BCEWithLogitsLoss(pos_weight)",
+            "use_sqrt": True,
+            "max_weight": 10.0,
+            "pos_weights": class_weight_summary,
+        },
+        class_weights_path,
+    )
+
+    print("\n===== CLASS WEIGHTS =====")
+    print("Using BCEWithLogitsLoss(pos_weight=...)")
+    for cls, stats in class_weight_summary.items():
+        print(
+            f"{cls}: positives={stats['positive_count']} | "
+            f"negatives={stats['negative_count']} | "
+            f"raw={stats['raw_pos_weight']:.4f} | "
+            f"used={stats['used_pos_weight']:.4f}"
+        )
+    print("Class weights saved to:", class_weights_path)
+    
     history = []
     best_val_macro_f1 = -1.0
     best_epoch = -1
@@ -440,6 +552,7 @@ def run_model_pipeline(pipeline_bundle: dict):
             class_names=class_names,
             optimizer=optimizer,
             threshold=THRESHOLD,
+            bce_criterion=bce_criterion,
         )
 
         val_metrics = _run_one_epoch(
@@ -449,6 +562,7 @@ def run_model_pipeline(pipeline_bundle: dict):
             class_names=class_names,
             optimizer=None,
             threshold=THRESHOLD,
+            bce_criterion=bce_criterion,
         )
 
         scheduler.step(val_metrics["macro_f1"])
@@ -568,6 +682,7 @@ def run_model_pipeline(pipeline_bundle: dict):
             class_names=class_names,
             optimizer=None,
             threshold=THRESHOLD,
+            bce_criterion=bce_criterion,
         )
 
         test_metrics_path = os.path.join(dirs["metrics_dir"], "test_metrics.json")
@@ -594,3 +709,7 @@ def run_model_pipeline(pipeline_bundle: dict):
         "test_metrics": test_metrics,
         "training_dir": dirs["round_dir"],
     }
+    
+    
+    
+    
