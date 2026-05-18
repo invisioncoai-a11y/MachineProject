@@ -53,9 +53,9 @@ INITIAL_LABEL_RATIO = 0.05
 # =========================
 # Training
 # =========================
-BATCH_SIZE = 16
+BATCH_SIZE = 8
 NUM_WORKERS = 0
-NUM_EPOCHS = 8
+NUM_EPOCHS = 5
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
 THRESHOLD = 0.5
@@ -63,7 +63,7 @@ THRESHOLD = 0.5
 # =========================
 # Active Learning
 # =========================
-NUM_ROUNDS = 5
+NUM_ROUNDS = 3
 QUERY_BATCH_SIZE = 200
 TRAIN_ON_SEED_ONLY_AT_ROUND0 = True
 
