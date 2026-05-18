@@ -54,7 +54,7 @@ INITIAL_LABEL_RATIO = 0.05
 # Training
 # =========================
 BATCH_SIZE = 16
-NUM_WORKERS = 2
+NUM_WORKERS = 0
 NUM_EPOCHS = 8
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
